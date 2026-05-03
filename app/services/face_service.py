@@ -57,7 +57,7 @@ def analyze_face_mediapipe(video_path: str) -> FaceAnalysis:
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    sample_interval = max(1, int(fps / 2) * 4)  # Analyze ~2 frames/sec instead of 15 for speed
+    sample_interval = max(1, int(fps))  # 1 frame per second for speed
 
     detection_scores = []
     expression_scores = []
@@ -68,14 +68,17 @@ def analyze_face_mediapipe(video_path: str) -> FaceAnalysis:
 
     with vision.FaceLandmarker.create_from_options(options) as landmarker:
         frame_idx = 0
+        analyzed = 0
+        MAX_ANALYZE_FRAMES = 45  # Cap at 45 frames (~45 seconds at 1fps)
         while cap.isOpened():
             ret, frame = cap.read()
-            if not ret:
+            if not ret or analyzed >= MAX_ANALYZE_FRAMES:
                 break
 
             frame_time = frame_idx / fps
 
             if frame_idx % sample_interval == 0:
+                analyzed += 1
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
                 timestamp_ms = int(frame_time * 1000)
@@ -152,7 +155,7 @@ def analyze_face_opencv(video_path: str) -> FaceAnalysis:
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    sample_interval = max(1, int(fps / 2) * 4)  # Analyze ~2 frames/sec instead of 15 for speed
+    sample_interval = max(1, int(fps))  # 1 frame per second for speed
 
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
@@ -162,15 +165,18 @@ def analyze_face_opencv(video_path: str) -> FaceAnalysis:
     sec_buf = []
     cur_sec = 0
     frame_idx = 0
+    analyzed = 0
+    MAX_ANALYZE_FRAMES = 45
 
     while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
+        if not ret or analyzed >= MAX_ANALYZE_FRAMES:
             break
 
         frame_time = frame_idx / fps
 
         if frame_idx % sample_interval == 0:
+            analyzed += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = face_cascade.detectMultiScale(gray, 1.3, 5)
             detected = len(faces) > 0

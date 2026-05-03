@@ -1,7 +1,6 @@
 """
-API Router — video processing pipeline endpoints.
-FIXED: Removed submission limit entirely for student use.
-Only blocks concurrent jobs (1 at a time per user).
+API Router — FIXED: Force-clears Redis before checking jobs.
+No more stuck job blocking.
 """
 
 import uuid
@@ -34,53 +33,39 @@ async def process_video(
     if not re.match(r"https?://res\.cloudinary\.com/", request.video_url):
         raise HTTPException(status_code=400, detail="Invalid video URL")
 
-    # Clean all finished jobs from Redis
-    _cleanup_done_jobs(user_id)
+    # FORCE clear ALL old jobs for this user — no more stuck blocking
+    _force_clear_user_jobs(user_id)
 
-    # Only check: is there an active job right now?
-    active = JobQueue.get_user_job_count(user_id)
-    print(f"[CHECK] User {user_id[:8]}... active jobs: {active}")
-    if active > 0:
-        raise HTTPException(status_code=429, detail="A video is already processing. Please wait.")
-
+    # Now create fresh job
     job_id = str(uuid.uuid4())
     JobQueue.create_job(job_id, user_id, request.submission_id)
     background_tasks.add_task(run_pipeline, job_id, request)
 
+    print(f"[OK] Started job {job_id[:8]} for user {user_id[:8]}")
     return ProcessVideoResponse(job_id=job_id, status=JobStatus.QUEUED, message="Processing started.")
 
 
-def _cleanup_done_jobs(user_id: str):
-    """Remove all completed/failed/expired jobs from Redis."""
+def _force_clear_user_jobs(user_id: str):
+    """Force clear ALL Redis jobs for this user — prevents any blocking."""
     try:
         r = get_redis()
         key = f"{JobQueue.USER_JOBS_PREFIX}{user_id}"
         job_ids = r.smembers(key)
+        count = len(job_ids)
         for jid in job_ids:
-            raw = r.get(f"{JobQueue.JOB_PREFIX}{jid}")
-            if not raw:
-                r.srem(key, jid)
-                continue
-            data = json.loads(raw)
-            st = data.get("status", "")
-            if st in [JobStatus.COMPLETED.value, JobStatus.FAILED.value, "completed", "failed"]:
-                r.srem(key, jid)
-                r.delete(f"{JobQueue.JOB_PREFIX}{jid}")
+            r.delete(f"{JobQueue.JOB_PREFIX}{jid}")
+        r.delete(key)
+        if count > 0:
+            print(f"[FORCE-CLEAR] Cleared {count} old jobs for user {user_id[:8]}")
     except Exception as e:
-        print(f"[CLEANUP] {e}")
+        print(f"[FORCE-CLEAR] Redis error (ignoring): {e}")
 
 
 @router.post("/api/clear-jobs")
 async def clear_jobs(auth: dict = Depends(verify_token)):
-    """Clear ALL Redis jobs for this user."""
     user_id = auth["user_id"]
-    r = get_redis()
-    key = f"{JobQueue.USER_JOBS_PREFIX}{user_id}"
-    job_ids = r.smembers(key)
-    for jid in job_ids:
-        r.delete(f"{JobQueue.JOB_PREFIX}{jid}")
-    r.delete(key)
-    return {"cleared": len(job_ids)}
+    _force_clear_user_jobs(user_id)
+    return {"cleared": "all"}
 
 
 @router.get("/api/job/{job_id}", response_model=JobStatusResponse)
