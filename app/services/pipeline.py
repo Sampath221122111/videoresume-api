@@ -1,20 +1,22 @@
 """
-Pipeline — LIGHTWEIGHT for Render free tier (512MB RAM).
-Skips MediaPipe face analysis (needs 1GB+).
-Core: Download → Audio → Transcribe → Tone → Resume → Clip → Upload.
+Pipeline — ULTRA MINIMAL for 512MB RAM.
+NO librosa, NO mediapipe, NO opencv loaded.
+Only: ffmpeg (system) + Groq API (cloud) + ReportLab (small).
+All scoring estimated from transcript quality.
 """
 
 import time
 import traceback
+import os
 from concurrent.futures import ThreadPoolExecutor
 from app.models.schemas import (
     JobStatus, ProcessingResult, ProcessVideoRequest,
-    FaceAnalysis, AudioAnalysis,
+    FaceAnalysis, AudioAnalysis, TranscriptionResult,
 )
 from app.utils.queue import JobQueue
 from app.services import (
     download_video, validate_video, extract_audio,
-    transcribe_audio, analyze_tone,
+    transcribe_audio,
     select_highlight, generate_resume, generate_pdf,
     generate_highlight_clip, cleanup_temp_files,
     upload_pdf, upload_video_clip,
@@ -52,29 +54,25 @@ async def run_pipeline(job_id: str, request: ProcessVideoRequest) -> None:
         audio_path = extract_audio(video_path, job_id)
         log("Extract Audio", t)
 
-        # ── Transcribe (via Groq Whisper API — no local memory needed) ──
+        # ── Transcribe via Groq Cloud API (no local memory) ──
         t = time.time()
-        JobQueue.update_job(job_id, JobStatus.TRANSCRIBING, 25, "Transcribing speech...")
+        JobQueue.update_job(job_id, JobStatus.TRANSCRIBING, 30, "Transcribing speech...")
         transcript = transcribe_audio(audio_path)
         log("Transcribe", t)
 
         if not transcript.full_text.strip():
             raise ValueError("No speech detected. Record with clear audio.")
 
-        # ── Tone Analysis (librosa — lightweight) ──
-        t = time.time()
-        JobQueue.update_job(job_id, JobStatus.ANALYZING_TONE, 40, "Analyzing voice tone...")
-        audio_analysis = analyze_tone(audio_path, transcript)
-        log("Tone Analysis", t)
+        # ── Score from transcript (NO librosa, NO mediapipe) ──
+        JobQueue.update_job(job_id, JobStatus.ANALYZING_TONE, 45, "Analyzing performance...")
+        audio_analysis = _score_from_transcript(transcript, video_duration)
+        face_analysis = _estimate_face(audio_analysis)
+        print(f"[PIPELINE] Scores: conf={audio_analysis.confidence_score}, expr={face_analysis.avg_expression_score}, eye={face_analysis.avg_eye_contact_score}")
 
-        # ── Skip Face Analysis — use estimated scores based on tone ──
-        # This saves ~500MB RAM (MediaPipe + OpenCV + TensorFlow)
-        face_analysis = _estimate_face_scores(audio_analysis)
-        print(f"[PIPELINE] Face scores estimated (skipped MediaPipe to save memory)")
-
+        # ── Select highlight ──
         highlight = select_highlight(audio_analysis, face_analysis, transcript, video_duration)
 
-        # ── PARALLEL: Resume/PDF + Clip ──
+        # ── Resume + Clip in parallel ──
         t = time.time()
         JobQueue.update_job(job_id, JobStatus.GENERATING_RESUME, 55, "Building resume & clip...")
 
@@ -94,9 +92,9 @@ async def run_pipeline(job_id: str, request: ProcessVideoRequest) -> None:
             cf = ex.submit(generate_highlight_clip, video_path, job_id, highlight)
             resume_data, pdf_path = rf.result()
             clip_path = cf.result()
-        log("Resume+Clip (parallel)", t)
+        log("Resume+Clip", t)
 
-        # ── PARALLEL: Upload ──
+        # ── Upload in parallel ──
         t = time.time()
         JobQueue.update_job(job_id, JobStatus.UPLOADING_RESULTS, 80, "Uploading results...")
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -104,7 +102,7 @@ async def run_pipeline(job_id: str, request: ProcessVideoRequest) -> None:
             uf = ex.submit(upload_video_clip, clip_path, request.user_id, job_id)
             resume_url = pf.result()
             clip_url = uf.result()
-        log("Upload (parallel)", t)
+        log("Upload", t)
 
         # ── Save ──
         JobQueue.update_job(job_id, JobStatus.UPLOADING_RESULTS, 95, "Saving...")
@@ -142,22 +140,55 @@ async def run_pipeline(job_id: str, request: ProcessVideoRequest) -> None:
             pass
 
 
-def _estimate_face_scores(audio_analysis: AudioAnalysis) -> FaceAnalysis:
+def _score_from_transcript(transcript: TranscriptionResult, duration: float) -> AudioAnalysis:
     """
-    Estimate face scores from audio analysis.
-    Used when MediaPipe can't run (low memory environments).
-    Provides reasonable scores based on voice confidence.
+    Calculate scores from transcript text — NO librosa needed.
+    Uses word count, speaking rate, vocabulary diversity as proxies.
     """
-    confidence = audio_analysis.confidence_score
+    text = transcript.full_text
+    words = text.split()
+    word_count = len(words)
+    
+    # Speaking rate (words per minute)
+    wpm = (word_count / max(duration, 1)) * 60
+    
+    # Unique words ratio (vocabulary diversity)
+    unique_ratio = len(set(w.lower() for w in words)) / max(word_count, 1)
+    
+    # Average word length (complexity)
+    avg_word_len = sum(len(w) for w in words) / max(word_count, 1)
+    
+    # Calculate confidence score
+    # Good: 120-180 WPM, diverse vocabulary, longer words
+    wpm_score = max(0, min(100, 100 - abs(wpm - 150) * 0.8))
+    vocab_score = min(100, unique_ratio * 200)
+    length_score = min(100, avg_word_len * 20)
+    word_count_score = min(100, word_count * 0.5)  # More words = more confident
+    
+    confidence = round((wpm_score * 0.3 + vocab_score * 0.25 + length_score * 0.15 + word_count_score * 0.3), 1)
+    confidence = max(35, min(95, confidence))  # Clamp between 35-95
+    
+    # Estimate energy from WPM
+    energy = max(0.01, min(0.1, wpm / 2000))
+    
+    return AudioAnalysis(
+        confidence_score=confidence,
+        average_energy=energy,
+        speaking_rate_wpm=round(wpm, 1),
+        pitch_mean=180.0,
+        pitch_std=30.0,
+        energy_std=0.02,
+        silence_ratio=max(0.1, 1 - (word_count / max(duration * 2.5, 1))),
+        speech_segments=[],
+    )
 
-    # Estimate expression from voice energy/confidence
-    expression = min(100, max(30, confidence * 0.85 + 10))
-    # Estimate eye contact (slightly lower than confidence)
-    eye_contact = min(100, max(25, confidence * 0.8 + 8))
 
+def _estimate_face(audio: AudioAnalysis) -> FaceAnalysis:
+    """Estimate face scores from voice analysis."""
+    conf = audio.confidence_score
     return FaceAnalysis(
         face_detected=True,
-        avg_eye_contact_score=round(eye_contact, 1),
-        avg_expression_score=round(expression, 1),
+        avg_eye_contact_score=round(max(30, min(95, conf * 0.85 + 8)), 1),
+        avg_expression_score=round(max(30, min(95, conf * 0.9 + 5)), 1),
         per_second_scores=[],
     )

@@ -3,8 +3,9 @@ from .video_service import (
     generate_highlight_clip, cleanup_temp_files, get_video_duration,
 )
 from .transcription_service import transcribe_audio
-from .tone_service import analyze_tone
-from .face_service import analyze_face
+# REMOVED: tone_service (librosa ~200MB) and face_service (mediapipe ~400MB)
+# These are NOT imported at startup to save memory on free tier.
+# Pipeline calculates scores from transcript text instead.
 from .resume_service import generate_resume
 from .pdf_service import generate_pdf
 from .highlight_service import select_highlight
